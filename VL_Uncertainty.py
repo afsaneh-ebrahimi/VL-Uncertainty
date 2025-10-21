@@ -10,16 +10,20 @@ from llm.Qwen import Qwen
 from util.visual_perturbation import *
 from util.textual_perturbation import *
 from util.misc import *
+from util.geometric_scores import knn_distance, lid_mle
+from util.reference_set import load_reference_set
 import torch
 import argparse
 import re
 import collections
 import math
 from tqdm import tqdm
-import json 
+import json
 import random
 import os
 import warnings
+import numpy as np
+from typing import List
 warnings.filterwarnings("ignore")
 
 
@@ -73,6 +77,19 @@ def parse_args():
     parser.add_argument('--inference_temp', type=float, default=0.1)
     parser.add_argument('--sampling_temp', type=float, default=1.0)
     parser.add_argument('--sampling_time', type=int, default=5)
+    parser.add_argument('--detection_strategy', type=str, default='uncertainty_only',
+                        choices=['uncertainty_only', 'geometric_only', 'hybrid'])
+    parser.add_argument('--reference_path', type=str, default=None,
+                        help='Path to a cached reference embedding set for geometric detection.')
+    parser.add_argument('--geometric_score_types', type=str, nargs='+', default=['knn', 'lid'],
+                        choices=['knn', 'lid'])
+    parser.add_argument('--geometric_metric', type=str, default='cosine', choices=['cosine', 'euclidean'])
+    parser.add_argument('--knn_k', type=int, default=10)
+    parser.add_argument('--lid_k', type=int, default=20)
+    parser.add_argument('--geometric_threshold', type=float, default=0.5)
+    parser.add_argument('--uncertainty_weight', type=float, default=1.0)
+    parser.add_argument('--geometric_weight', type=float, default=1.0)
+    parser.add_argument('--hybrid_threshold', type=float, default=1.0)
     args = parser.parse_args()
     return args
 
@@ -101,6 +118,21 @@ def obatin_single_sample(args, benchmark, idx, log_dict):
     return sample
 
 def infer_single_sample(args, lvlm, sample, is_sampling, llm, log_dict):
+    embedding = None
+    if getattr(args, 'use_geometric', False):
+        try:
+            embedding_tensor = lvlm.encode_prompt(sample['img'], sample['question'])
+            embedding = embedding_tensor.squeeze(0).cpu()
+        except NotImplementedError:
+            if not getattr(args, '_geometric_disabled', False):
+                print(f"[Geometric] LVLM {args.lvlm} does not expose prompt embeddings. Disabling geometric detection.")
+                args._geometric_disabled = True
+            args.use_geometric = False
+        except Exception as exc:
+            if not getattr(args, '_geometric_disabled', False):
+                print(f"[Geometric] Failed to extract embedding: {exc}. Disabling geometric detection.")
+                args._geometric_disabled = True
+            args.use_geometric = False
     ans = lvlm.generate(
         sample['img'],
         sample['question'],
@@ -108,6 +140,8 @@ def infer_single_sample(args, lvlm, sample, is_sampling, llm, log_dict):
     )
     if not is_sampling:
         log_dict[sample['idx']]['ans'] = ans
+        if embedding is not None:
+            log_dict[sample['idx']]['embedding'] = embedding
         flag_ans_correct = True
         if BENCHMARK_TYPE[args.benchmark] == 'MULTI_CHOICE':
             flag_ans_correct = str(sample['gt_ans']) in ans
@@ -122,6 +156,8 @@ def infer_single_sample(args, lvlm, sample, is_sampling, llm, log_dict):
         log_dict[sample['idx']]['flag_ans_correct'] = flag_ans_correct
     else:
         log_dict[sample['idx']]['ans_sampling_list'].append(ans)
+        if embedding is not None:
+            log_dict[sample['idx']]['perturbed_embeddings'].append(embedding)
 
 def perturbation_of_visual_prompt(args, sample):
     perturbed_img_list = []
@@ -271,33 +307,95 @@ def uncertainty_estimation(args, sample, llm, log_dict):
     uncertainty = -sum((cnt / args.sampling_time) * math.log2(cnt / args.sampling_time) for cnt in cluster_dis.values())
     log_dict[sample['idx']]['uncertainty'] = uncertainty
 
+def compute_geometric_scores(args, sample, log_dict):
+    if not getattr(args, 'use_geometric', False):
+        return
+    reference_embeddings = getattr(args, 'reference_embeddings', None)
+    if reference_embeddings is None:
+        return
+    embeddings: List[torch.Tensor] = []
+    base_embedding = log_dict[sample['idx']].get('embedding')
+    if base_embedding is not None:
+        embeddings.append(base_embedding)
+    for emb in log_dict[sample['idx']].get('perturbed_embeddings', []):
+        if emb is not None:
+            embeddings.append(emb)
+    if not embeddings:
+        return
+    batch = torch.stack(embeddings, dim=0).to(reference_embeddings.dtype)
+    results = {}
+    if 'knn' in args.geometric_score_types and args.knn_k > 0:
+        knn_vals = knn_distance(batch, reference_embeddings, args.knn_k, metric=args.geometric_metric)
+        results['knn_scores'] = knn_vals.tolist()
+        results['knn'] = float(knn_vals.mean().item())
+    if 'lid' in args.geometric_score_types and args.lid_k > 1:
+        try:
+            lid_vals = lid_mle(batch, reference_embeddings, args.lid_k, metric=args.geometric_metric)
+            results['lid_scores'] = lid_vals.tolist()
+            results['lid'] = float(lid_vals.mean().item())
+        except ValueError:
+            pass
+    aggregated_values = [results[key] for key in ['knn', 'lid'] if key in results]
+    if aggregated_values:
+        results['aggregated'] = float(np.mean(aggregated_values))
+    log_dict[sample['idx']]['geometric_scores'] = results
+
 def hallucination_detection(args, sample, log_dict):
-    flag_predict_hallucination = log_dict[sample['idx']]['uncertainty'] >= args.uncertainty_thres
-    log_dict[sample['idx']]['uncertainty_thres'] = args.uncertainty_thres
-    log_dict[sample['idx']]['flag_predict_hallucination'] = flag_predict_hallucination
-    
-    flag_detection_correct = (log_dict[sample['idx']]['flag_ans_correct'] and not flag_predict_hallucination) or (not log_dict[sample['idx']]['flag_ans_correct'] and flag_predict_hallucination)
-    log_dict[sample['idx']]['flag_detection_correct'] = flag_detection_correct
+    idx = sample['idx']
+    base_uncertainty = log_dict[idx]['uncertainty']
+    strategy = args.detection_strategy
+    geometric_scores = log_dict[idx].get('geometric_scores', {})
+
+    detection_score = base_uncertainty
+    threshold = args.uncertainty_thres
+
+    if strategy == 'geometric_only':
+        detection_score = geometric_scores.get('aggregated')
+        threshold = args.geometric_threshold
+    elif strategy == 'hybrid':
+        aggregated = geometric_scores.get('aggregated')
+        detection_score = None if aggregated is None else args.uncertainty_weight * base_uncertainty + args.geometric_weight * aggregated
+        threshold = args.hybrid_threshold
+        log_dict[idx]['combined_score'] = detection_score
+
+    log_dict[idx]['detection_strategy'] = strategy
+
+    if detection_score is None or (isinstance(detection_score, float) and math.isnan(detection_score)):
+        flag_predict_hallucination = False
+    else:
+        flag_predict_hallucination = detection_score >= threshold
+
+    log_dict[idx]['detection_score'] = detection_score
+    log_dict[idx]['detection_threshold'] = threshold
+    log_dict[idx]['uncertainty_thres'] = args.uncertainty_thres
+    log_dict[idx]['flag_predict_hallucination'] = flag_predict_hallucination
+
+    flag_detection_correct = (log_dict[idx]['flag_ans_correct'] and not flag_predict_hallucination) or (not log_dict[idx]['flag_ans_correct'] and flag_predict_hallucination)
+    log_dict[idx]['flag_detection_correct'] = flag_detection_correct
 
 def vl_uncertainty(args, lvlm, sample, llm, log_dict):
     perturbed_img_list = perturbation_of_visual_prompt(args, sample)
     perturbed_question_list = perturbation_of_textual_prompt(args, sample, llm)
     log_dict[sample['idx']]['perturbed_question_list'] = perturbed_question_list
     perturbed_prompt_list = combination_of_perturbed_prompt(args, sample, perturbed_img_list, perturbed_question_list, log_dict)
-    
+
     log_dict[sample['idx']]['ans_sampling_list'] = []
+    log_dict[sample['idx']]['perturbed_embeddings'] = []
     for i in range(args.sampling_time):
         infer_single_sample(args, lvlm, perturbed_prompt_list[i], True, llm, log_dict)
-    
+
     uncertainty_estimation(args, sample, llm, log_dict)
+    compute_geometric_scores(args, sample, log_dict)
     hallucination_detection(args, sample, log_dict)
 
 def semantic_entropy(args, lvlm, sample, llm, log_dict):
     log_dict[sample['idx']]['ans_sampling_list'] = []
+    log_dict[sample['idx']]['perturbed_embeddings'] = []
     for _ in range(args.sampling_time):
         infer_single_sample(args, lvlm, sample, True, llm, log_dict)
-    
+
     uncertainty_estimation(args, sample, llm, log_dict)
+    compute_geometric_scores(args, sample, log_dict)
     hallucination_detection(args, sample, log_dict)
 
 def handle_single(args, idx, lvlm, benchmark, llm, log_dict):
@@ -353,6 +451,17 @@ def fix_seed(seed=0):
 def main():
     fix_seed(0)
     args = parse_args()
+    args.use_geometric = args.detection_strategy in ('geometric_only', 'hybrid')
+    args.reference_embeddings = None
+    args.reference_metadata = []
+    args.reference_config = {}
+    if args.use_geometric:
+        if not args.reference_path:
+            raise ValueError('Geometric detection requires --reference_path to be specified.')
+        reference_embeddings, reference_metadata, reference_config = load_reference_set(args.reference_path)
+        args.reference_embeddings = reference_embeddings
+        args.reference_metadata = reference_metadata
+        args.reference_config = reference_config
     lvlm = obtain_lvlm(args)
     benchmark = obtain_benchmark(args)
     llm = obtain_llm(args)
