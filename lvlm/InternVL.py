@@ -99,6 +99,7 @@ class InternVL:
 
     def __init__(self, version):
         self.version = version
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.build_model()
 
     def build_model(self):
@@ -115,7 +116,7 @@ class InternVL:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, use_fast=False)
 
     def generate(self, image, question, temp):
-        pixel_values = load_image(image, max_num=4).to(torch.bfloat16).to(0)
+        pixel_values = load_image(image, max_num=4).to(torch.bfloat16).to(self.device)
         generation_config = dict(
             max_new_tokens=32,
             do_sample=True,
@@ -128,3 +129,9 @@ class InternVL:
             generation_config
         )
         return answer
+
+    @torch.inference_mode()
+    def encode_prompt(self, image, question):
+        raise NotImplementedError(
+            "Geometric prompt embeddings are not yet implemented for InternVL models."
+        )
